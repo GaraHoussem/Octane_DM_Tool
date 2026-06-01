@@ -4608,6 +4608,7 @@ class OctaneTicketProcessorGUI:
             self._log(f"AUSFÜHRUNG: {total} Tickets werden bearbeitet", "HEADER")
             self._log("=" * 60, "HEADER")
 
+            for i, action in enumerate(actions):
                 did = action["defect_id"]
                 self._update_progress_label(f"Schreibe {i+1}/{total}: {did}")
                 self._update_progress_bar((i + 1) / total * 100)

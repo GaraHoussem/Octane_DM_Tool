@@ -99,6 +99,14 @@ EXPECTED_BEHAVIOR_KEYWORDS = [
     "per spec",
 ]
 
+# Regex patterns that indicate "rejected due to missing traces".
+# Uses word-boundary anchors to match variations like "missing DLT traces",
+# "missing idcevo DLT traces", "please add dlt traces", etc.
+MISSING_TRACES_PATTERNS = [
+    re.compile(r'\bmissing\b[\w\s]{0,40}\btraces\b', re.IGNORECASE),
+    re.compile(r'\bplease\s+(?:attach|add)\b[\w\s]{0,40}\btraces\b', re.IGNORECASE),
+]
+
 
 # ── Netrc helpers ─────────────────────────────────────────────────────────────
 
@@ -389,6 +397,73 @@ def set_octane_not_reproducible(session: requests.Session,
         return False
 
 
+# ── OCTANE: update Blocking reason → Additional Information necessary ─────────
+
+BLOCKING_REASON_ADDITIONAL_INFO_NAME = "Additional Information necessary"
+BLOCKING_REASON_ADDITIONAL_INFO = {
+    "type": "list_node",
+    "id": "20vl1n7zw5vd2ikdkmnyyxn9k",
+    "logical_name": "20vl1n7zw5vd2ikdkmnyyxn9k",
+}
+_BLOCKING_REASON_ROOT = "q0pk3rm202r22hwjk06xyd27m"
+
+
+def _discover_list_node(session: requests.Session, root_id: str,
+                        name: str) -> Optional[Dict[str, str]]:
+    """Find a list_node by display name under a given root.
+    Returns a dict suitable for OCTANE field update, or None."""
+    try:
+        r = session.get(
+            f"{OCTANE_BASE}/list_nodes",
+            params={
+                "fields": "id,name,logical_name",
+                "query": f'"list_root EQ {{id={root_id}}}; name EQ ^{name}^"',
+                "limit": 100,
+            },
+            timeout=30,
+        )
+        if not r.ok:
+            return None
+    except requests.RequestException:
+        return None
+
+    for node in r.json().get("data", []):
+        if node.get("name", "").lower() == name.lower():
+            return {
+                "type": "list_node",
+                "id": node["id"],
+                "logical_name": node.get("logical_name", node["id"]),
+            }
+    return None
+
+
+def set_octane_additional_info_needed(session: requests.Session,
+                                      defect_id: str) -> bool:
+    """Set 'Blocking reason' to 'Additional Information necessary'.
+    Uses the known list_node ID, with runtime discovery as fallback.
+    Returns True on success, False otherwise."""
+    node = BLOCKING_REASON_ADDITIONAL_INFO
+
+    payload = {BLOCKING_REASON_FIELD: node}
+    try:
+        r = session.put(
+            f"{OCTANE_BASE}/defects/{defect_id}",
+            json=payload,
+            timeout=30,
+        )
+        if r.ok:
+            return True
+        payload["id"] = defect_id
+        r = session.put(
+            f"{OCTANE_BASE}/defects/{defect_id}",
+            json=payload,
+            timeout=30,
+        )
+        return r.ok
+    except requests.RequestException:
+        return False
+
+
 # ── OCTANE: change phase ──────────────────────────────────────────────────────
 
 TARGET_PHASE = "01-New"
@@ -617,6 +692,32 @@ def _find_excerpt(text: str, keyword: str, radius: int = 120) -> str:
     if end < len(text):
         snippet = snippet + "…"
     return snippet
+
+
+def find_missing_traces_comment(
+        comments: List[Dict[str, Any]]
+) -> Optional[Dict[str, str]]:
+    """
+    Scan comments newest-first for missing-traces regex patterns.
+    Returns a dict with match details, or None if no match found.
+    """
+    for comment in comments:
+        text = extract_comment_text(comment)
+
+        for pattern in MISSING_TRACES_PATTERNS:
+            m = pattern.search(text)
+            if m:
+                matched_text = m.group(0)
+                author = (comment.get("author") or {}).get("displayName", "Unknown")
+                created = (comment.get("created") or "")[:10]
+                excerpt = _find_excerpt(text, matched_text)
+                return {
+                    "keyword": matched_text,
+                    "author": author,
+                    "created": created,
+                    "excerpt": excerpt,
+                }
+    return None
 
 
 def extract_master_duplicate_octane_id(
@@ -910,9 +1011,63 @@ def main() -> None:
             sys.exit(0)
         else:
             print(f"  ❌  No expected-behavior keyword found in any comment.")
-            print(f"      Rejection reason is NOT documented as 'expected behavior'.")
-            print()
-            sys.exit(2)
+            print(f"      Continuing to check for 'missing traces' …\n")
+
+            # ── PATH A2: Missing traces ──────────────────────────────────
+            print(f"[4] Scanning comments for missing-traces patterns …")
+            print(f"  Patterns: {[p.pattern for p in MISSING_TRACES_PATTERNS]}\n")
+
+            traces_match = find_missing_traces_comment(comments)
+
+            if traces_match:
+                print(f"  ✅  MISSING TRACES — match found in comments")
+                print(f"  {'─'*54}")
+                print(f"  Matched  : \"{traces_match['keyword']}\"")
+                print(f"  Author   : {traces_match['author']}")
+                print(f"  Date     : {traces_match['created']}")
+                print(f"  Excerpt  :\n")
+                for line in traces_match["excerpt"].splitlines():
+                    print(f"    {line}")
+
+                print(f"\n[5] Verifying OCTANE ID via Jira remote links …")
+                octane_id_from_jira = extract_octane_id_from_jira_ticket(session, jira_url, issue_key)
+                if octane_id_from_jira:
+                    print(f"  OCTANE ID (from Jira): {octane_id_from_jira}")
+                    if octane_id_from_jira == args.octane_id:
+                        print(f"  ✓ Matches input OCTANE ID")
+                    else:
+                        print(f"  ⚠️  Differs from input OCTANE #{args.octane_id}")
+                else:
+                    print(f"  (No OCTANE link in Jira remote links — using input #{args.octane_id})")
+
+                print(f"\n[6] Setting OCTANE 'Blocking reason' → '{BLOCKING_REASON_ADDITIONAL_INFO_NAME}' …")
+                updated = set_octane_additional_info_needed(octane_session, args.octane_id)
+                if updated:
+                    print(f"  ✓ OCTANE #{args.octane_id} updated successfully")
+                else:
+                    print(f"  ⚠️  Could not update OCTANE field (may already be set or lack permissions)")
+
+                print(f"\n[7] Moving OCTANE #{args.octane_id} to phase '{TARGET_PHASE}' …")
+                phase_ok = set_octane_phase(octane_session, args.octane_id)
+                if phase_ok:
+                    print(f"  ✓ Phase changed to '{TARGET_PHASE}'")
+                else:
+                    print(f"  ⚠️  Could not change phase (may not be an allowed transition)")
+
+                print(f"\n  ── Result ──")
+                print(f"  OCTANE ID : {args.octane_id}")
+                print(f"  Jira ID   : {issue_key}")
+                print(f"  Verdict   : Rejected — Missing Traces")
+                print(f"  OCTANE updated: {'Yes' if updated else 'No'}")
+                print(f"  Phase → {TARGET_PHASE}: {'Yes' if phase_ok else 'No'}")
+                print(f"  URL: {OCTANE_URL}/ui/entity-navigation?p={SHARED_SPACE}/{WORKSPACE}&entityType=work_item&id={args.octane_id}")
+                print()
+                sys.exit(0)
+            else:
+                print(f"  ❌  No missing-traces pattern found in any comment.")
+                print(f"      Rejection reason is NOT documented as 'expected behavior' or 'missing traces'.")
+                print()
+                sys.exit(2)
 
     # ══════════════════════════════════════════════════════════════════════════
     # PATH B: Duplicate → find master OCTANE ID, update child
