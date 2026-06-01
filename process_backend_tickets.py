@@ -207,12 +207,15 @@ BACKEND_PROVIDERS = [
 
 # ── Comment detection patterns ────────────────────────────────────────────────
 
+# Provider keywords used in flexible "assign ... <provider>" pattern
+_PROVIDER_KEYWORDS = r'HERE|Zenrin|backend|BE|Perseus|LOS|FuDe|Traffic|POI|Map\s*Data'
+
 # Generic backend keywords — indicates ticket should go to a backend provider
 BACKEND_KEYWORDS_PATTERNS = [
     re.compile(r'\bmust\s+be\s+(?:checked|analyzed|investigated)\s+(?:from|in|by)\s+(?:the\s+)?(?:backend|BE|DB|HERE)\b', re.IGNORECASE),
     re.compile(r'\bplease\s+(?:check|investigate|analyze)\s+(?:in|from|at)\s+(?:the\s+)?(?:backend|BE|DB|HERE)\b', re.IGNORECASE),
-    re.compile(r'\bplease\s+assign\s+to\s+(?:HERE|Zenrin|backend|BE)\b', re.IGNORECASE),
-    re.compile(r'\bmust\s+be\s+assigned\s+to\s+(?:HERE|Zenrin|backend|BE)\b', re.IGNORECASE),
+    # Flexible "assign ... <provider>" — matches any words between assign and the provider keyword
+    re.compile(r'\bassign\w*\s+(?:\S+\s+){0,6}(?:' + _PROVIDER_KEYWORDS + r')\b', re.IGNORECASE),
     re.compile(r'\b(?:DB|BE|backend|HERE)\s+issue\b', re.IGNORECASE),
     re.compile(r'\b(?:data\s*base|database)\s+issue\b', re.IGNORECASE),
     re.compile(r'\bbackend\s+(?:problem|defect|bug)\b', re.IGNORECASE),
@@ -225,9 +228,9 @@ DEFECT_CATEGORY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Assigned ECU pattern in comments
+# Assigned ECU pattern in comments (matches both "assigned ECU:" and "assignedECU:")
 ASSIGNED_ECU_PATTERN = re.compile(
-    r'assigned\s+ECU\s*[:=]\s*(\S+)',
+    r'assigned\s*ECU\s*[:=]\s*(\S+)',
     re.IGNORECASE,
 )
 
@@ -308,7 +311,7 @@ def _find_provider_by_category(category: str) -> Optional[int]:
 
 def _find_provider_by_ecu(ecu: str, full_text: str = "") -> Optional[int]:
     """Find provider index by ECU name. Uses owner names to disambiguate."""
-    ecu_lower = ecu.lower()
+    ecu_lower = ecu.strip(",.;:)]}").lower()
     candidates = []
     for i, p in enumerate(BACKEND_PROVIDERS):
         if p.get("assigned_ecu"):
@@ -592,11 +595,12 @@ def main() -> None:
 
     # ── Step 2: Verify rejection ──────────────────────────────────────────────
     print(f"\n[2] Checking resolution …")
-    if res_name.lower() not in REJECTED_RESOLUTIONS:
-        print(f"  ℹ️  Resolution is '{res_name}' — not Rejected.")
-        print(f"      This script only handles Rejected tickets routed to backend.")
+    accepted_resolutions = REJECTED_RESOLUTIONS | {"won't do"}
+    if res_name.lower() not in accepted_resolutions:
+        print(f"  ℹ️  Resolution is '{res_name}' — not Rejected/Won't Do.")
+        print(f"      This script only handles Rejected/Won't Do tickets routed to backend.")
         sys.exit(0)
-    print(f"  ⚠️  Ticket is REJECTED  ('{res_name}')")
+    print(f"  ⚠️  Ticket resolution: '{res_name}'")
 
     # ── Step 3: Scan comments for backend signals ─────────────────────────────
     print(f"\n[3] Scanning comments for backend routing signals …")
