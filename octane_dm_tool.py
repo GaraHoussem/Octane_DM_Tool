@@ -53,12 +53,17 @@ OCTANE_URL_PATTERN = re.compile(
 
 DUPLICATE_JIRA_ID_PATTERN = re.compile(r'(?:IDCEVODEV|HU22DM)-\d+')
 OCTANE_ID_PATTERN = re.compile(r'(?<!\d)(\d{6,7})(?!\d)')
+JIRA_COLOR_TAG_PATTERN = re.compile(r'\{color(?::[^}]*)?\}')
+JIRA_CODE_BLOCK_PATTERN = re.compile(r'\{code(?::[^}]*)?\}.*?\{code\}', re.DOTALL)
 
 DUPLICATE_KEYWORDS = [
     "duplicate to", "duplicates to", "duplicated to", "duplicate of",
     "duplicates", "dup to", "dup of",
-    "master is", "master ticket", "master:", "master defect", "master ",
+    "master is", "master ticket", "master:", "master defect",
 ]
+
+# Authors to ignore for duplicate keyword scanning (automated bots / pre-analysis tools)
+DUPLICATE_IGNORE_AUTHORS = {"techuser apinext ci cd"}
 
 EXPECTED_BEHAVIOR_KEYWORDS = [
     "works as specified", "works as expected", "works as designed",
@@ -462,6 +467,29 @@ def set_octane_phase(session: requests.Session, defect_id: str,
 
 # ── Jira API helpers ──────────────────────────────────────────────────────────
 
+def get_previous_resolution(session: requests.Session, jira_url: str, issue_key: str) -> Optional[str]:
+    """Check Jira changelog for the resolution value immediately before it was set to 'Rejected'.
+    Returns the previous resolution (fromString) of the last change that set resolution to Rejected."""
+    url = f"{jira_url}/rest/api/2/issue/{issue_key}"
+    params = {"expand": "changelog", "fields": "summary"}
+    try:
+        r = session.get(url, params=params, timeout=30)
+    except requests.RequestException:
+        return None
+    if not r.ok:
+        return None
+    data = r.json()
+    changelog = data.get("changelog", {})
+    last_from = None
+    for history in changelog.get("histories", []):
+        for item in history.get("items", []):
+            if item.get("field", "").lower() == "resolution":
+                to_val = (item.get("toString") or "").lower()
+                if to_val == "rejected":
+                    last_from = (item.get("fromString") or "").lower()
+    return last_from
+
+
 def get_issue(session: requests.Session, jira_url: str, issue_key: str) -> Optional[Dict[str, Any]]:
     """Fetch issue metadata."""
     url = f"{jira_url}/rest/api/2/issue/{issue_key}"
@@ -818,12 +846,17 @@ def extract_master_duplicate_octane_id(jira_session, jira_url: str, octane_sessi
     print(f"  {len(comments)} comment(s) to scan.\n")
 
     for comment in comments:
+        # Skip automated bot comments
+        comment_author_lower = (comment.get("author") or {}).get("displayName", "").lower()
+        if comment_author_lower in DUPLICATE_IGNORE_AUTHORS:
+            continue
         text = extract_comment_text(comment)
-        text_lower = text.lower()
+        # Strip code blocks for keyword matching (avoid false matches in log traces)
+        text_for_keywords = JIRA_CODE_BLOCK_PATTERN.sub('', text).lower()
 
         matched_keyword = None
         for keyword in DUPLICATE_KEYWORDS:
-            if keyword in text_lower:
+            if keyword in text_for_keywords:
                 matched_keyword = keyword
                 break
         if not matched_keyword:
@@ -838,13 +871,16 @@ def extract_master_duplicate_octane_id(jira_session, jira_url: str, octane_sessi
         print()
 
         jira_ids = list(dict.fromkeys(m for m in DUPLICATE_JIRA_ID_PATTERN.findall(text) if m != issue_key))
+        # Strip code blocks and color markup before extracting bare OCTANE IDs
+        text_clean = JIRA_CODE_BLOCK_PATTERN.sub('', text)
+        text_clean = JIRA_COLOR_TAG_PATTERN.sub('', text_clean)
         # Extract bare OCTANE IDs but exclude numbers that are part of Jira IDs (e.g. "899011" from "IDCEVODEV-899011")
         jira_id_numbers = set()
         for jid in jira_ids:
             parts = jid.split("-")
             if len(parts) == 2:
                 jira_id_numbers.add(parts[1])
-        octane_ids = list(dict.fromkeys(oid for oid in OCTANE_ID_PATTERN.findall(text) if oid not in jira_id_numbers))
+        octane_ids = list(dict.fromkeys(oid for oid in OCTANE_ID_PATTERN.findall(text_clean) if oid not in jira_id_numbers))
         print(f"  Jira IDs found (excl. self): {jira_ids}")
         print(f"  Bare OCTANE IDs found: {octane_ids}")
         print()
@@ -1009,17 +1045,43 @@ def create_web_app():
             comments = get_comments(jira_session, JIRA_URL, issue_key)
             result["comment_count"] = len(comments)
 
-            # Find the index of the first (newest) comment with a duplicate keyword + ticket ID
+            # Step 1: Check Jira changelog — what was the resolution before it became "Rejected"?
+            prev_resolution = get_previous_resolution(jira_session, JIRA_URL, issue_key)
+            if prev_resolution == "cannot reproduce":
+                result["path"] = "cannot_reproduce"
+                return flask_jsonify(result)
+            elif prev_resolution in DUPLICATE_RESOLUTIONS:
+                master_octane_id, matched_comment = extract_master_duplicate_octane_id(jira_session, JIRA_URL, octane_session, issue_key)
+                if matched_comment:
+                    result["duplicate_comment"] = matched_comment
+                result["path"] = "duplicate"
+                if master_octane_id:
+                    result["master_octane_id"] = master_octane_id
+                    result["master_url"] = f"{OCTANE_URL}/ui/entity-navigation?p={SHARED_SPACE}/{WORKSPACE}&entityType=work_item&id={master_octane_id}"
+                else:
+                    warning = (matched_comment or {}).get("no_octane_warning", "")
+                    result["error"] = warning or "Could not determine master OCTANE ID from comments."
+                return flask_jsonify(result)
+
+            # Step 2: Comment-based classification (expected behavior, backend, missing traces)
+            # Also scan for duplicate keywords in comments
             dup_comment_index = None
             for idx, comment in enumerate(comments):
+                # Skip automated bot comments
+                comment_author = (comment.get("author") or {}).get("displayName", "").lower()
+                if comment_author in DUPLICATE_IGNORE_AUTHORS:
+                    continue
                 text = extract_comment_text(comment)
-                text_lower = text.lower()
-                has_dup_keyword = any(kw in text_lower for kw in DUPLICATE_KEYWORDS)
+                # Strip code blocks for keyword matching
+                text_for_keywords = JIRA_CODE_BLOCK_PATTERN.sub('', text).lower()
+                has_dup_keyword = any(kw in text_for_keywords for kw in DUPLICATE_KEYWORDS)
                 if not has_dup_keyword:
                     continue
-                # Check if this comment actually has a ticket reference
-                jira_ids = [m for m in DUPLICATE_JIRA_ID_PATTERN.findall(text) if m != issue_key]
-                octane_ids = OCTANE_ID_PATTERN.findall(text)
+                # Strip code blocks and color tags before looking for ticket references
+                text_stripped = JIRA_CODE_BLOCK_PATTERN.sub('', text)
+                text_stripped = JIRA_COLOR_TAG_PATTERN.sub('', text_stripped)
+                jira_ids = [m for m in DUPLICATE_JIRA_ID_PATTERN.findall(text_stripped) if m != issue_key]
+                octane_ids = OCTANE_ID_PATTERN.findall(text_stripped)
                 if jira_ids or octane_ids:
                     dup_comment_index = idx
                     break
@@ -1338,7 +1400,7 @@ def create_web_app():
             if (data.path==='rejected_backend' && data.classification.provider_index!==null) selectProvider(data.classification.provider_index);
         }
         function renderMissingJiraId(data) {
-            return `<div class="card"><h2>Jira ID Missing</h2>
+            return `<div class="card"><h2>Octane Ticket ${escHtml(data.octane_id)} has no Jira ID set.</h2>
                 <p style="margin-bottom:10px">'Ticket no. supplier' field is empty in OCTANE #${escHtml(data.octane_id)}.</p>
                 <p style="font-size:0.78rem;color:#64748b">Enter the Jira ID to continue processing:</p>
                 <div style="margin-top:8px"><input type="text" id="manualJiraId" placeholder="e.g. IDCEVODEV-1034622 or HU22DM-392311" style="width:280px"></div>
@@ -1380,7 +1442,7 @@ def create_web_app():
         function renderExpectedBehavior(data) {
             const c=data.classification;
             return `<div class="card"><h2>Planned Action: Reject as Expected Behaviour</h2>
-                <div class="excerpt-box">${escHtml(c.excerpt)}</div>
+                <div class="comment-box"><div class="comment-meta">${escHtml(c.author)} &middot; ${escHtml(c.created)}</div>${escHtml(c.excerpt)}</div>
                 <div class="will-set"><h4>Will set in OCTANE:</h4><p>Blocking reason &rarr; Expected behaviour<br>Phase &rarr; ${escHtml('""" + TARGET_PHASE + """')}</p></div>
                 <div class="action-bar"><button class="btn-confirm" onclick="executeAction('expected_behavior')">Confirm</button><button class="btn-cancel" onclick="cancel()">Cancel</button></div></div>`;
         }
@@ -1409,7 +1471,7 @@ def create_web_app():
         function renderMissingTraces(data) {
             const c=data.classification;
             return `<div class="card"><h2>Planned Action: Reject — Missing Traces</h2>
-                <div class="excerpt-box">${escHtml(c.excerpt)}</div>
+                <div class="comment-box"><div class="comment-meta">${escHtml(c.author)} &middot; ${escHtml(c.created)}</div>${escHtml(c.excerpt)}</div>
                 <div class="will-set"><h4>Will set in OCTANE:</h4><p>Blocking reason &rarr; Additional Information necessary<br>Phase &rarr; ${escHtml('""" + TARGET_PHASE + """')}</p></div>
                 <div class="action-bar"><button class="btn-confirm" onclick="executeAction('missing_traces')">Confirm</button><button class="btn-cancel" onclick="cancel()">Cancel</button></div></div>`;
         }
