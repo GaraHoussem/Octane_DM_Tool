@@ -32,6 +32,22 @@ The following resolutions are configured in the BMW Jira instance (`jira.cc.bmwg
   - "as designed" / "by design"
   - "per specification" / "per spec"
 
+## Custom Field IDs
+
+| Field ID | Field Name | Type | Description |
+|---|---|---|---|
+| `customfield_10812` | Integrated in Version(s) | option | The software version(s) the fix was integrated into |
+| `customfield_11202` | Pre-Integrated in Version(s) | array | Branch/version where the fix is pre-integrated (e.g. `apinext/navigation-app/release/2.20.6`) |
+| `customfield_10811` | Resolved in Version(s) | option | The version in which the issue was resolved |
+| `customfield_10809` | Found in SW Version(s) | option | The software version where the defect was found |
+| `customfield_10810` | Found in HW Version(s) | option | The hardware version where the defect was found |
+| `customfield_10300` | Domain | option | Domain category (e.g. "Navigation") |
+| `customfield_10804` | Defect Category | option | Application category (e.g. "Application Navigation ECE") |
+| `customfield_10115` | Team | any | Responsible team (e.g. "APINEXT: Honey Bee") |
+| `customfield_10813` | — | option | Platform identifier (e.g. "NA5") |
+| `customfield_11200` | Integration Due Date | date | Deadline for integration |
+| `customfield_11201` | Integration Requests | — | Integration request tracking |
+
 ## Jira Instance
 
 - **URL:** `https://jira.cc.bmwgroup.net`
