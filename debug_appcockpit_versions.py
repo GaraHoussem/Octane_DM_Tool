@@ -381,6 +381,10 @@ def main():
         "--timeout", type=int, default=120,
         help="SSO login timeout in seconds (default: 120)",
     )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Output results as JSON (for programmatic use)",
+    )
     args = parser.parse_args()
 
     print(f"\n{'='*62}")
@@ -419,12 +423,21 @@ def main():
         # Step 3: Extract versions
         versions_20x, versions_19x = extract_versions(page)
 
-        # Print results
-        print_results(versions_20x, versions_19x)
+        # Output results
+        if args.json:
+            import json as json_mod
+            output = {
+                "versions_20x": [v["version"] for v in versions_20x],
+                "versions_19x": [v["version"] for v in versions_19x],
+            }
+            print(json_mod.dumps(output))
+        else:
+            print_results(versions_20x, versions_19x)
 
         context.close()
 
-    print("Done.")
+    if not args.json:
+        print("Done.")
 
 
 if __name__ == "__main__":

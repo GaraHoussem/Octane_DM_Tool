@@ -47,6 +47,7 @@ OCTANE_TOKEN_ENV = "OCTANE_TOKEN"
 REJECTED_RESOLUTIONS = {"rejected", "won't do"}
 DUPLICATE_RESOLUTIONS = {"duplicate"}
 CANNOT_REPRODUCE_RESOLUTIONS = {"cannot reproduce"}
+DONE_RESOLUTIONS = {"done"}
 
 OCTANE_URL_PATTERN = re.compile(
     r'octane[^"\'>\s]*?(?:/(?:defects?|work[_-]?items?|entity)[/=]|[?&]id=)(\d+)', re.IGNORECASE)
@@ -395,21 +396,54 @@ def set_octane_not_reproducible(session: requests.Session, defect_id: str) -> bo
         return False
 
 
+# Known list_root IDs for target fields (discovered via API testing).
+_FIELD_LIST_ROOTS = {
+    "target_i_step_udf": "ypz1k378y1jyzu9l24z80nx3m",   # "PbM I-Step"
+    "target_week_udf":   "75ezlndn4nm87cjo1woj3r3j9",   # "Pbm Target Week List"
+}
+
+
+def _resolve_list_node_field(session: requests.Session, field_name: str,
+                             value: str, defect_id: Optional[str] = None) -> Optional[Dict[str, str]]:
+    """Resolve a user-entered text value to a list_node object for the given field."""
+    root_id = _FIELD_LIST_ROOTS.get(field_name)
+    print(f"  [resolve] field={field_name}, value='{value}', root_id={root_id}")
+    if root_id:
+        node = _discover_list_node(session, root_id, value)
+        print(f"  [resolve] result: {node}")
+        if node:
+            return node
+    return None
+
+
 def _discover_list_node(session: requests.Session, root_id: str, name: str) -> Optional[Dict[str, str]]:
-    """Find a list_node by display name under a given root."""
+    """Find a list_node by display name under a given root.
+
+    Searches globally by name then filters by list_root ID in Python,
+    because OCTANE's query parser does not accept non-numeric IDs in
+    the ``{id=...}`` syntax.
+    """
     try:
         r = session.get(f"{OCTANE_BASE}/list_nodes", params={
-            "fields": "id,name,logical_name",
-            "query": f'"list_root EQ {{id={root_id}}}; name EQ ^{name}^"',
+            "fields": "id,name,logical_name,list_root",
+            "query": f'"name EQ ^{name}^"',
             "limit": 100,
         }, timeout=30)
+        print(f"  [discover] search name='{name}' → {r.status_code}, "
+              f"count={len(r.json().get('data', [])) if r.ok else '?'}")
         if not r.ok:
+            print(f"  [discover] error: {r.text[:200]}")
             return None
-    except requests.RequestException:
+    except requests.RequestException as e:
+        print(f"  [discover] exception: {e}")
         return None
     for node in r.json().get("data", []):
-        if node.get("name", "").lower() == name.lower():
+        lr = node.get("list_root", {})
+        lr_id = lr.get("id", "") if isinstance(lr, dict) else ""
+        if node.get("name", "").lower() == name.lower() and lr_id == root_id:
+            print(f"  [discover] matched: id={node['id']}, root={lr_id}")
             return {"type": "list_node", "id": node["id"], "logical_name": node.get("logical_name", node["id"])}
+    print(f"  [discover] no match for root={root_id}")
     return None
 
 
@@ -1034,10 +1068,16 @@ def create_web_app():
         is_rejected = res_lower in REJECTED_RESOLUTIONS
         is_duplicate = res_lower in DUPLICATE_RESOLUTIONS
         is_cannot_reproduce = res_lower in CANNOT_REPRODUCE_RESOLUTIONS
+        is_done = res_lower in DONE_RESOLUTIONS
 
-        if not is_rejected and not is_duplicate and not is_cannot_reproduce:
+        if not is_rejected and not is_duplicate and not is_cannot_reproduce and not is_done:
             result["path"] = "none"
             result["message"] = f"Resolution is '{res_name}' — no action needed."
+            return flask_jsonify(result)
+
+        # PATH D: Done — need version selection
+        if is_done:
+            result["path"] = "done"
             return flask_jsonify(result)
 
         # PATH A: Rejected
@@ -1231,11 +1271,124 @@ def create_web_app():
             result["duplicate_set"] = updated
             result["phase_set"] = phase_ok
             result["success"] = updated or phase_ok
+        elif action == "done":
+            versions = data.get("versions", [])
+            issue_key = data.get("issue_key", "")
+            target_i_step = data.get("target_i_step", "").strip()
+            target_week = data.get("target_week", "").strip()
+            move_to_pre_verification = data.get("move_to_pre_verification", False)
+            if not versions and not target_i_step and not target_week and not move_to_pre_verification:
+                return flask_jsonify({"error": "No fields to update"}), 400
+
+            # ── Jira: set Integrated in Version(s) ──
+            if versions and issue_key:
+                formatted = [f"navigation-app/{v}" for v in versions]
+                url = f"{JIRA_URL}/rest/api/2/issue/{issue_key}"
+                payload = {"fields": {"customfield_10812": formatted}}
+                try:
+                    r = jira_session.put(url, json=payload, timeout=30)
+                    result["jira_success"] = r.ok
+                    if not r.ok:
+                        result["jira_error"] = r.text[:300]
+                except requests.RequestException as e:
+                    result["jira_success"] = False
+                    result["jira_error"] = str(e)
+                result["versions_set"] = formatted
+            else:
+                result["jira_success"] = True  # nothing to do
+
+            # ── OCTANE: set Target I-Step and/or Target Week ──
+            octane_payload = {}
+            octane_fields_display = {}
+            if target_i_step:
+                node = _resolve_list_node_field(octane_session, "target_i_step_udf", target_i_step, octane_id)
+                if node:
+                    octane_payload["target_i_step_udf"] = node
+                    octane_fields_display["target_i_step_udf"] = target_i_step
+                else:
+                    result["octane_success"] = False
+                    result["octane_error"] = f"Could not resolve Target I-Step value '{target_i_step}' in OCTANE list nodes"
+            if target_week:
+                node = _resolve_list_node_field(octane_session, "target_week_udf", target_week, octane_id)
+                if node:
+                    octane_payload["target_week_udf"] = node
+                    octane_fields_display["target_week_udf"] = target_week
+                else:
+                    # Try as plain string (field type may vary)
+                    octane_payload["target_week_udf"] = target_week
+                    octane_fields_display["target_week_udf"] = target_week
+            if octane_payload and not result.get("octane_error"):
+                import pprint
+                print(f"  [done] OCTANE PUT payload: {pprint.pformat(octane_payload)}")
+                try:
+                    r = octane_session.put(f"{OCTANE_BASE}/defects/{octane_id}", json=octane_payload, timeout=30)
+                    print(f"  [done] OCTANE PUT → {r.status_code}")
+                    if not r.ok:
+                        print(f"  [done] OCTANE PUT error: {r.text[:300]}")
+                        octane_payload["id"] = octane_id
+                        r = octane_session.put(f"{OCTANE_BASE}/defects/{octane_id}", json=octane_payload, timeout=30)
+                        print(f"  [done] OCTANE PUT retry → {r.status_code}")
+                    result["octane_success"] = r.ok
+                    if not r.ok:
+                        result["octane_error"] = r.text[:300]
+                except requests.RequestException as e:
+                    result["octane_success"] = False
+                    result["octane_error"] = str(e)
+                result["octane_fields_set"] = octane_fields_display
+            elif not result.get("octane_error"):
+                result["octane_success"] = True
+
+            # ── OCTANE: move phase 04 → 05 → 07 if requested ──
+            if move_to_pre_verification:
+                closed_in_version = data.get("closed_in_version", "").strip()
+                phase_ok = set_octane_phase(octane_session, octane_id, "05-In Testing")
+                if phase_ok:
+                    phase7_extra = {}
+                    if closed_in_version:
+                        phase7_extra["closed_in_ver_udf"] = f"navigation-app/{closed_in_version}"
+                    phase_ok = set_octane_phase(octane_session, octane_id, "07-In Pre-Verification", extra_fields=phase7_extra if phase7_extra else None)
+                result["phase_set"] = phase_ok
+                if phase_ok and closed_in_version:
+                    result["closed_in_version_set"] = f"navigation-app/{closed_in_version}"
+                if not phase_ok:
+                    result["phase_error"] = "Failed to transition to 07-In Pre-Verification"
+
+            result["success"] = result.get("jira_success", True) and result.get("octane_success", True) and result.get("phase_set", True)
         else:
             return flask_jsonify({"error": f"Unknown action: {action}"}), 400
 
         result["url"] = f"{OCTANE_URL}/ui/entity-navigation?p={SHARED_SPACE}/{WORKSPACE}&entityType=work_item&id={octane_id}"
         return flask_jsonify(result)
+
+    _cached_versions = {}
+
+    @app.route("/api/versions", methods=["GET"])
+    def api_versions():
+        """Run App Cockpit version extraction and return JSON (cached after first call)."""
+        if _cached_versions:
+            return flask_jsonify(_cached_versions)
+
+        import subprocess
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_appcockpit_versions.py")
+        try:
+            proc = subprocess.run(
+                ["/opt/homebrew/bin/python3.11", script_path, "--json"],
+                capture_output=True, text=True, timeout=180,
+            )
+            if proc.returncode != 0:
+                return flask_jsonify({"error": f"Version extraction failed: {proc.stderr[-500:]}"}), 500
+            # Find the JSON line in stdout (skip any print noise)
+            for line in proc.stdout.strip().splitlines():
+                line = line.strip()
+                if line.startswith("{"):
+                    data = json.loads(line)
+                    _cached_versions.update(data)
+                    return flask_jsonify(data)
+            return flask_jsonify({"error": "No JSON output from version script"}), 500
+        except subprocess.TimeoutExpired:
+            return flask_jsonify({"error": "Version extraction timed out (180s)"}), 504
+        except Exception as e:
+            return flask_jsonify({"error": f"Version extraction error: {e}"}), 500
 
     HTML_PAGE = """
 <!DOCTYPE html>
@@ -1287,6 +1440,7 @@ def create_web_app():
         .badge-missing { background: #ffedd5; color: #ea580c; }
         .badge-cannot-reproduce { background: #f3e8ff; color: #9333ea; }
         .badge-duplicate { background: #fef3c7; color: #d97706; }
+        .badge-done { background: #d1fae5; color: #047857; }
         .comment-box {
             background: #f1f5f9; border-left: 3px solid #0ea5e9;
             padding: 10px 12px; margin: 10px 0; border-radius: 0 8px 8px 0;
@@ -1396,8 +1550,10 @@ def create_web_app():
             else if (data.path==='rejected_missing_traces') html+=renderMissingTraces(data);
             else if (data.path==='cannot_reproduce') html+=renderCannotReproduce(data);
             else if (data.path==='duplicate') html+=renderDuplicate(data);
+            else if (data.path==='done') html+=renderDone(data);
             document.getElementById('results').innerHTML = html;
             if (data.path==='rejected_backend' && data.classification.provider_index!==null) selectProvider(data.classification.provider_index);
+            if (data.path==='done') loadVersions();
         }
         function renderMissingJiraId(data) {
             return `<div class="card"><h2>Octane Ticket ${escHtml(data.octane_id)} has no Jira ID set.</h2>
@@ -1434,6 +1590,7 @@ def create_web_app():
             else if (data.path&&data.path.startsWith('rejected_missing')) badge='<span class="badge badge-missing">Missing Traces</span>';
             else if (data.path==='cannot_reproduce') badge='<span class="badge badge-cannot-reproduce">Cannot Reproduce</span>';
             else if (data.path==='duplicate') badge='<span class="badge badge-duplicate">Duplicate</span>';
+            else if (data.path==='done') badge='<span class="badge badge-done">Done</span>';
             return `<div class="card"><h2>Ticket Info ${badge}</h2><div class="info-grid">
                 <span class="info-label">OCTANE</span><span class="info-value"><a href="${escHtml(data.octane_url)}" target="_blank">#${escHtml(data.octane_id)}</a></span>
                 <span class="info-label">Jira</span><span class="info-value"><a href="${escHtml(data.jira_url)}" target="_blank">${escHtml(data.issue_key)}</a></span>
@@ -1500,6 +1657,92 @@ def create_web_app():
                 <div class="will-set"><h4>Will set in OCTANE:</h4><p>Blocking reason &rarr; Child (Duplicate)<br>Relation to &rarr; ${escHtml(data.master_octane_id)}<br>Phase &rarr; ${escHtml('""" + TARGET_PHASE + """')}</p></div>
                 <div class="action-bar"><button class="btn-confirm" onclick="executeDuplicate()">Confirm</button><button class="btn-cancel" onclick="cancel()">Cancel</button></div></div>`;
         }
+        function renderDone(data) {
+            return `<div class="card" id="done-card"><h2>Resolution: Done — Select Integrated Version(s)</h2>
+                <p style="margin-bottom:12px;font-size:0.78rem;color:#64748b">Loading available versions from App Cockpit…</p>
+                <div id="versions-loading"><span class="spinner"></span><span class="loading-text">Fetching versions…</span></div>
+                <div id="versions-content" class="hidden">
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+                        <div><h3 style="color:#0891b2;font-size:0.82rem;font-weight:700;margin-bottom:8px">Navigation App 2.20.x</h3>
+                            <select id="version20" style="width:100%;padding:8px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:0.8rem;background:#f8fafc">
+                                <option value="">— none —</option>
+                            </select>
+                        </div>
+                        <div><h3 style="color:#0891b2;font-size:0.82rem;font-weight:700;margin-bottom:8px">Navigation App 2.19.x</h3>
+                            <select id="version19" style="width:100%;padding:8px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:0.8rem;background:#f8fafc">
+                                <option value="">— none —</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px">
+                        <div><label style="font-size:0.78rem;font-weight:600;color:#64748b;display:block;margin-bottom:4px">Target I-Step</label>
+                            <input type="text" id="targetIStep" placeholder="e.g. NA25" style="width:100%;padding:8px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:0.8rem;background:#f8fafc">
+                        </div>
+                        <div><label style="font-size:0.78rem;font-weight:600;color:#64748b;display:block;margin-bottom:4px">Target Week</label>
+                            <input type="text" id="targetWeek" placeholder="e.g. KW26" style="width:100%;padding:8px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:0.8rem;background:#f8fafc">
+                        </div>
+                    </div>
+                    <div style="margin-top:16px;padding:10px;border:1.5px solid #e2e8f0;border-radius:8px;background:#f0fdf4">
+                        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.82rem;font-weight:600;color:#166534">
+                            <input type="checkbox" id="moveToPreVerification" style="width:16px;height:16px;accent-color:#16a34a" onchange="toggleClosedInVersion()">
+                            Move OCTANE ticket to 07-In Pre-Verification
+                        </label>
+                        <p style="margin:4px 0 0 24px;font-size:0.72rem;color:#64748b">Will transition: 04-In Progress → 05-In Testing → 07-In Pre-Verification</p>
+                        <div id="closedInVersionRow" class="hidden" style="margin-top:10px;padding-left:24px">
+                            <label style="font-size:0.78rem;font-weight:600;color:#64748b;display:block;margin-bottom:4px">Closed in version (required for phase 7)</label>
+                            <select id="closedInVersion" style="width:100%;max-width:300px;padding:8px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:0.8rem;background:#f8fafc">
+                                <option value="">— select version —</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="will-set" style="margin-top:12px"><h4>Will set:</h4><p>Jira: Integrated in Version(s) &rarr; <span id="versions-preview">—</span><br>OCTANE: Target I-Step &amp; Target Week</p></div>
+                    <div class="action-bar"><button class="btn-confirm" onclick="executeDone()">Confirm</button><button class="btn-cancel" onclick="cancel()">Cancel</button></div>
+                </div></div>`;
+        }
+        async function loadVersions() {
+            try {
+                const resp = await fetch('/api/versions');
+                const data = await resp.json();
+                if (!resp.ok) { document.getElementById('versions-loading').innerHTML=`<p style="color:#f43f5e">${escHtml(data.error)}</p>`; return; }
+                const sel20 = document.getElementById('version20');
+                const sel19 = document.getElementById('version19');
+                (data.versions_20x||[]).forEach(v => { const o=document.createElement('option'); o.value=v; o.textContent=v; sel20.appendChild(o); });
+                (data.versions_19x||[]).forEach(v => { const o=document.createElement('option'); o.value=v; o.textContent=v; sel19.appendChild(o); });
+                sel20.addEventListener('change', updateVersionPreview);
+                sel19.addEventListener('change', updateVersionPreview);
+                const selClosed = document.getElementById('closedInVersion');
+                (data.versions_20x||[]).forEach(v => { const o=document.createElement('option'); o.value=v; o.textContent=v; selClosed.appendChild(o); });
+                (data.versions_19x||[]).forEach(v => { const o=document.createElement('option'); o.value=v; o.textContent=v; selClosed.appendChild(o); });
+                document.getElementById('versions-loading').classList.add('hidden');
+                document.getElementById('versions-content').classList.remove('hidden');
+            } catch(e) { document.getElementById('versions-loading').innerHTML=`<p style="color:#f43f5e">Failed to load versions: ${escHtml(e.message)}</p>`; }
+        }
+        function toggleClosedInVersion() {
+            const row = document.getElementById('closedInVersionRow');
+            if (document.getElementById('moveToPreVerification').checked) { row.classList.remove('hidden'); } else { row.classList.add('hidden'); }
+        }
+        function updateVersionPreview() {
+            const v20 = document.getElementById('version20').value;
+            const v19 = document.getElementById('version19').value;
+            const parts = [];
+            if (v20) parts.push('navigation-app/' + v20);
+            if (v19) parts.push('navigation-app/' + v19);
+            document.getElementById('versions-preview').textContent = parts.length ? parts.join(', ') : '—';
+        }
+        async function executeDone() {
+            const v20 = document.getElementById('version20').value;
+            const v19 = document.getElementById('version19').value;
+            const versions = [];
+            if (v20) versions.push(v20);
+            if (v19) versions.push(v19);
+            const targetIStep = document.getElementById('targetIStep').value.trim();
+            const targetWeek = document.getElementById('targetWeek').value.trim();
+            const moveToPreVerification = document.getElementById('moveToPreVerification').checked;
+            const closedInVersion = document.getElementById('closedInVersion').value;
+            if (moveToPreVerification && !closedInVersion) { alert('Please select a Closed in version for phase 7 transition.'); return; }
+            if (!versions.length && !targetIStep && !targetWeek && !moveToPreVerification) { alert('Please fill at least one field or select phase transition.'); return; }
+            await doExecute({octane_id:currentData.octane_id, action:'done', issue_key:currentData.issue_key, versions:versions, target_i_step:targetIStep, target_week:targetWeek, move_to_pre_verification:moveToPreVerification, closed_in_version:closedInVersion});
+        }
         async function executeAction(action){await doExecute({octane_id:currentData.octane_id,action:action});}
         async function executeBackend(){
             if(selectedProvider===null){alert('Please select a provider.');return;}
@@ -1524,9 +1767,25 @@ def create_web_app():
             if(result.phase_set!==undefined) d+=`<br>Phase: ${result.phase_set?'Set':'Failed'}`;
             if(result.provider) d+=`<br>Provider: ${escHtml(result.provider)}`;
             if(result.duplicate_set!==undefined) d+=`<br>Duplicate: ${result.duplicate_set?'Set':'Failed'}`;
+            if(result.versions_set) d+=`<br>Jira — Integrated in Version(s): ${escHtml(result.versions_set.join(', '))}`;
+            if(result.octane_fields_set) {
+                const fields = result.octane_fields_set;
+                if(fields.target_i_step_udf) d+=`<br>OCTANE — Target I-Step: ${escHtml(fields.target_i_step_udf)}`;
+                if(fields.target_week_udf) d+=`<br>OCTANE — Target Week: ${escHtml(fields.target_week_udf)}`;
+            }
+            if(result.jira_error) d+=`<br><span style="color:#f43f5e">Jira: ${escHtml(result.jira_error)}</span>`;
+            if(result.octane_error) d+=`<br><span style="color:#f43f5e">OCTANE: ${escHtml(result.octane_error)}</span>`;
+            if(result.error_detail) d+=`<br><span style="color:#f43f5e">${escHtml(result.error_detail)}</span>`;
+            let links = '';
+            if(result.action==='done') {
+                if(currentData.jira_url) links+=`<a href="${escHtml(currentData.jira_url)}" target="_blank">Open in Jira &rarr;</a> `;
+                if(result.url) links+=`<a href="${escHtml(result.url)}" target="_blank">Open in OCTANE &rarr;</a>`;
+            } else if(result.url) {
+                links=`<a href="${escHtml(result.url)}" target="_blank">Open in OCTANE &rarr;</a>`;
+            }
             document.getElementById('results').innerHTML+=`<div class="card result-card ${success?'':'error'}">
                 <h2>${success?'Success':'Failed'}</h2><p>OCTANE #${escHtml(result.octane_id)}${d}</p>
-                ${result.url?`<p style="margin-top:8px"><a href="${escHtml(result.url)}" target="_blank">Open in OCTANE &rarr;</a></p>`:''}</div>`;
+                ${links?`<p style="margin-top:8px">${links}</p>`:''}</div>`;
         }
         function cancel(){document.getElementById('results').innerHTML+=`<div class="card"><h2>Cancelled</h2><p>No changes were made.</p></div>`;}
         function escHtml(str){if(!str)return'';return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
