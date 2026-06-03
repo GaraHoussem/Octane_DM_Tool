@@ -53,3 +53,17 @@ The following resolutions are configured in the BMW Jira instance (`jira.cc.bmwg
 - **URL:** `https://jira.cc.bmwgroup.net`
 - **Auth:** Bearer token (Personal Access Token)
 - **API:** REST API v2 (`/rest/api/2/`)
+
+## OCTANE Phase Transition Constraints
+
+OCTANE enforces strict phase transition rules for defects. Not all phase jumps are allowed.
+
+| From Phase | To Phase | Allowed? | Notes |
+|---|---|---|---|
+| 04-In Progress | 01-New | ✅ | Requires `blocking_reason_udf` field |
+| 04-In Progress | 03-In Analysis | ❌ | Blocked by business rule |
+| 01-New | 03-In Analysis | ❌ | Blocked — once moved back to 01-New, cannot jump to 03 |
+| 04-In Progress | 05-In Testing | ✅ | |
+| 05-In Testing | 07-In Pre-Verification | ✅ | Requires `closed_in_ver_udf` and defect quality rating |
+
+**Important:** Moving a ticket from phase 4 to phase 1 and then attempting to move it to phase 3 does NOT work. The transition 01-New → 03-In Analysis is blocked by OCTANE's workflow rules.
